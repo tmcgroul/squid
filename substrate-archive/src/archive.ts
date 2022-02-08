@@ -7,6 +7,7 @@ import {
     SpecVersion,
     Extrinsic,
     ChainDescription,
+    OldTypes,
 } from "@subsquid/substrate-metadata"
 import {Codec} from "@subsquid/scale-codec"
 import {getTypesFromBundle} from "@subsquid/substrate-metadata/lib/old/typesBundle"
@@ -158,6 +159,8 @@ function omit(obj: any, ...keys: string[]): any {
 export class SubstrateArchive {
     private client: ResilientRpcClient
     private typesBundle?: string
+    private specDescription?: SpecDescription
+    private lastBlock?: LastBlock
 
     constructor(url: string, typesBundle?: string) {
         this.client = new ResilientRpcClient(url)
@@ -167,10 +170,9 @@ export class SubstrateArchive {
     async run(): Promise<void> {
         let db = await getConnection()
 
-        let lastBlock = await this.getLastBlock(db)
-        let blockHeight = lastBlock ? lastBlock.height + 1 : 1
-        
-        let specDescription: SpecDescription | undefined
+        this.lastBlock = await this.getLastBlock(db)
+        let blockHeight = this.lastBlock ? this.lastBlock.height + 1 : 1
+
         while (true) {
             console.log(`Processing block at ${blockHeight}`)
             let blockHash = await this.client.call<string>("chain_getBlockHash", [blockHeight])
@@ -178,69 +180,8 @@ export class SubstrateArchive {
             let signedBlock = await this.client.call<SignedBlock>("chain_getBlock", [blockHash])
             let header = await this.client.call("chain_getHeader", [blockHash])  // TODO: decode block author
 
-            let oldTypes
-            if (this.typesBundle) {
-                let typesBundle = assertNotNull(getOldTypesBundle(this.typesBundle))
-                oldTypes = getTypesFromBundle(typesBundle, runtimeVersion.specVersion)
-            }
-            if (lastBlock === undefined) {  // start indexing
-                let rawMetadata = await this.client.call<RawMetadata>("state_getMetadata", [blockHash])
-                let metadata = decodeMetadata(rawMetadata)
-                let description = getChainDescriptionFromMetadata(metadata, oldTypes)
-                specDescription = {spec: runtimeVersion.specVersion, description}
-
-                let metadataEntity = {
-                    spec: runtimeVersion.specVersion,
-                    block_height: blockHeight,
-                    block_hash: blockHash,
-                    data: rawMetadata,
-                }
-                await db.query(
-                    "INSERT INTO metadata(spec, block_height, block_hash, data) VALUES($1, $2, $3, $4)",
-                    Object.values(metadataEntity)
-                )
-            } else if (specDescription === undefined) {  // resume indexing
-                if (runtimeVersion.specVersion == lastBlock.spec) {
-                    let rawMetadata = await this.client.call<RawMetadata>("state_getMetadata", [blockHash])
-                    let metadata = decodeMetadata(rawMetadata)
-                    let description = getChainDescriptionFromMetadata(metadata, oldTypes)
-                    specDescription = {spec: runtimeVersion.specVersion, description}
-                } else {
-                    let rawMetadata = await this.client.call<RawMetadata>("state_getMetadata", [lastBlock.hash])
-                    let metadata = decodeMetadata(rawMetadata)
-                    let description = getChainDescriptionFromMetadata(metadata, oldTypes)
-                    specDescription = {spec: lastBlock.spec, description}
-
-                    let metadataEntity = {
-                        spec: lastBlock.spec,
-                        block_height: lastBlock.height,
-                        block_hash: lastBlock.hash,
-                        data: rawMetadata,
-                    }
-                    await db.query(
-                        "INSERT INTO metadata(spec, block_height, block_hash, data) VALUES($1, $2, $3, $4)",
-                        Object.values(metadataEntity)
-                    )
-                }
-            } else {
-                if (specDescription.spec != runtimeVersion.specVersion && runtimeVersion.specVersion == lastBlock.spec) {
-                    let rawMetadata = await this.client.call<RawMetadata>("state_getMetadata", [lastBlock.hash])
-                    let metadata = decodeMetadata(rawMetadata)
-                    let description = getChainDescriptionFromMetadata(metadata, oldTypes)
-                    specDescription = {spec: lastBlock.spec, description}
-
-                    let metadataEntity = {
-                        spec: lastBlock.spec,
-                        block_height: lastBlock.height,
-                        block_hash: lastBlock.hash,
-                        data: rawMetadata,
-                    }
-                    await db.query(
-                        "INSERT INTO metadata(spec, block_height, block_hash, data) VALUES($1, $2, $3, $4)",
-                        Object.values(metadataEntity)
-                    )
-                }
-            }
+            let oldTypes = this.getOldTypes(runtimeVersion.specVersion)
+            let specDescription = await this.getSpecDescription(db, blockHash, blockHeight, runtimeVersion.specVersion, oldTypes)
 
             let storageKey = "0x" + Buffer.from([
                 ...xxhashAsU8a("System", 128),
@@ -344,7 +285,7 @@ export class SubstrateArchive {
             }
 
             // TODO: disconnect from db
-            lastBlock = {...blockEntity, spec: runtimeVersion.specVersion}
+            this.lastBlock = {...blockEntity, spec: runtimeVersion.specVersion}
             blockHeight++
         }
     }
@@ -358,5 +299,85 @@ export class SubstrateArchive {
             lastBlock = {...blockEntity, spec: runtimeVersion.specVersion}
         }
         return lastBlock
+    }
+
+    private getOldTypes(spec: SpecVersion): OldTypes | undefined {
+        let oldTypes
+        if (this.typesBundle) {
+            let typesBundle = assertNotNull(getOldTypesBundle(this.typesBundle))
+            oldTypes = getTypesFromBundle(typesBundle, spec)
+        }
+        return oldTypes
+    }
+
+    private async getSpecDescription(
+        db: Client,
+        blockHash: string,
+        blockHeight: number,
+        spec: SpecVersion,
+        oldTypes?: OldTypes
+    ): Promise<SpecDescription> {
+        let specDescription
+        if (this.lastBlock === undefined) {  // start indexing
+            let rawMetadata = await this.client.call<RawMetadata>("state_getMetadata", [blockHash])
+            let metadata = decodeMetadata(rawMetadata)
+            let description = getChainDescriptionFromMetadata(metadata, oldTypes)
+            specDescription = {spec, description}
+
+            let metadataEntity = {
+                spec,
+                block_height: blockHeight,
+                block_hash: blockHash,
+                data: rawMetadata,
+            }
+            await db.query(
+                "INSERT INTO metadata(spec, block_height, block_hash, data) VALUES($1, $2, $3, $4)",
+                Object.values(metadataEntity)
+            )
+        } else if (this.specDescription === undefined) {  // resume indexing
+            if (spec == this.lastBlock.spec) {
+                let rawMetadata = await this.client.call<RawMetadata>("state_getMetadata", [blockHash])
+                let metadata = decodeMetadata(rawMetadata)
+                let description = getChainDescriptionFromMetadata(metadata, oldTypes)
+                specDescription = {spec, description}
+            } else {
+                let rawMetadata = await this.client.call<RawMetadata>("state_getMetadata", [this.lastBlock.hash])
+                let metadata = decodeMetadata(rawMetadata)
+                let description = getChainDescriptionFromMetadata(metadata, oldTypes)
+                specDescription = {spec: this.lastBlock.spec, description}
+
+                let metadataEntity = {
+                    spec: this.lastBlock.spec,
+                    block_height: this.lastBlock.height,
+                    block_hash: this.lastBlock.hash,
+                    data: rawMetadata,
+                }
+                await db.query(
+                    "INSERT INTO metadata(spec, block_height, block_hash, data) VALUES($1, $2, $3, $4)",
+                    Object.values(metadataEntity)
+                )
+            }
+        } else {
+            if (this.specDescription.spec != spec && spec == this.lastBlock.spec) {
+                let rawMetadata = await this.client.call<RawMetadata>("state_getMetadata", [this.lastBlock.hash])
+                let metadata = decodeMetadata(rawMetadata)
+                let description = getChainDescriptionFromMetadata(metadata, oldTypes)
+                specDescription = {spec: this.lastBlock.spec, description}
+
+                let metadataEntity = {
+                    spec: this.lastBlock.spec,
+                    block_height: this.lastBlock.height,
+                    block_hash: this.lastBlock.hash,
+                    data: rawMetadata,
+                }
+                await db.query(
+                    "INSERT INTO metadata(spec, block_height, block_hash, data) VALUES($1, $2, $3, $4)",
+                    Object.values(metadataEntity)
+                )
+            } else {
+                specDescription = this.specDescription
+            }
+        }
+        return specDescription
     }
 }
